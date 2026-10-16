@@ -41,6 +41,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// statusPollInterval bounds how long a Status reader can remain undecided
+// after finding mu held: it re-checks for an active Delete at this cadence
+// rather than blocking on mu, so a Delete that acquires mu after the reader's
+// check cannot queue the State RPC behind its cleanup. The task State RPC
+// carries a two second deadline, so a few milliseconds is imperceptible.
+const statusPollInterval = 5 * time.Millisecond
+
 // Init represents an initial process for a container
 type Init struct {
 	wg        sync.WaitGroup
@@ -60,10 +67,13 @@ type Init struct {
 	// order is mu -> statusMu, never the reverse.
 	statusMu sync.Mutex
 
-	// deleting is set for the duration of a Delete. Only then may Status skip
-	// mu: every other lifecycle operation still serializes readers through mu,
-	// so State cannot bypass an in-flight Start or return before SetExited has
-	// published the stopped state.
+	// deleting is published by the Delete that currently owns mu, for the
+	// duration of its cleanup, and cleared before that Delete releases mu.
+	// Only then may Status skip mu. A Delete merely queued behind another
+	// lifecycle operation has not published anything, so readers keep
+	// serializing with an in-flight Start or SetExited; and because the
+	// publication is scoped to the active owner, an overlapping Delete can
+	// neither inherit nor clobber it.
 	deleting atomic.Bool
 
 	waitBlock chan struct{}
@@ -269,22 +279,37 @@ func (p *Init) Status(ctx context.Context) (string, error) {
 		return "pausing", nil
 	}
 
-	if p.deleting.Load() {
-		// A Delete is cleaning up while holding mu. Answer from the observable
-		// state rather than blocking the State RPC behind the drain, the runc
-		// delete exec and the rootfs unmount (#14379). The state is still the
-		// pre-delete one until the delete completes, which is the truth: the
-		// task exists until it does not.
-		p.statusMu.Lock()
-		defer p.statusMu.Unlock()
+	for {
+		if p.deleting.Load() {
+			// A Delete owns mu and is draining stdio, exec'ing runc delete
+			// and unmounting the rootfs. Answer from the observable state
+			// rather than queueing the State RPC behind the cleanup
+			// (#14379). The state is still the pre-delete one until the
+			// delete completes, which is the truth: the task exists until
+			// it does not.
+			p.statusMu.Lock()
+			defer p.statusMu.Unlock()
 
-		return p.initState.Status(ctx)
+			return p.initState.Status(ctx)
+		}
+		if p.mu.TryLock() {
+			// mu is free, or held by another reader; a Delete publishes
+			// deleting only while it owns mu, so no Delete is active and
+			// the read is serialized against the lifecycle operations
+			// exactly as before.
+			defer p.mu.Unlock()
+
+			return p.initState.Status(ctx)
+		}
+		// A non-Delete lifecycle operation owns mu — a Start publishing
+		// `running` only after the runtime start returns, a SetExited
+		// whose transition follows the wait notification — and the reader
+		// must wait for it. Re-check on a short cadence instead of blocking
+		// on mu, so that a Delete which acquires mu after the check above
+		// is answered from the observable state rather than queuing the
+		// reader behind its cleanup.
+		time.Sleep(statusPollInterval)
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.initState.Status(ctx)
 }
 
 // setInitState swaps the state machine. Callers must hold mu; statusMu is
@@ -329,13 +354,15 @@ func (p *Init) setExited(status int) {
 
 // Delete the init process
 func (p *Init) Delete(ctx context.Context) error {
-	// Announce the delete before taking mu so the accessors can answer from the
-	// observable state instead of waiting for the slow cleanup below.
-	p.deleting.Store(true)
-	defer p.deleting.Store(false)
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Publish the exemption only once this Delete owns mu, and clear it
+	// before releasing mu: the flag must describe the active cleanup owner,
+	// never a Delete queued behind another operation, and an overlapping
+	// Delete must not inherit or clobber this one's publication.
+	p.deleting.Store(true)
+	defer p.deleting.Store(false)
 
 	return p.initState.Delete(ctx)
 }

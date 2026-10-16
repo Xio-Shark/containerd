@@ -57,10 +57,13 @@ type execProcess struct {
 	// never the reverse.
 	statusMu sync.Mutex
 
-	// deleting is set for the duration of a Delete. Only then may Status skip
-	// mu: every other lifecycle operation still serializes readers through mu,
-	// so State cannot bypass an in-flight Start or return before SetExited has
-	// published the stopped state.
+	// deleting is published by the Delete that currently owns mu, for the
+	// duration of its cleanup, and cleared before that Delete releases mu.
+	// Only then may Status skip mu. A Delete merely queued behind another
+	// lifecycle operation has not published anything, so readers keep
+	// serializing with an in-flight Start or SetExited; and because the
+	// publication is scoped to the active owner, an overlapping Delete can
+	// neither inherit nor clobber it.
 	deleting atomic.Bool
 
 	id      string
@@ -144,13 +147,15 @@ func (e *execProcess) setExited(status int) {
 }
 
 func (e *execProcess) Delete(ctx context.Context) error {
-	// Announce the delete before taking mu so the accessors can answer from the
-	// observable state instead of waiting for the slow cleanup below.
-	e.deleting.Store(true)
-	defer e.deleting.Store(false)
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Publish the exemption only once this Delete owns mu, and clear it
+	// before releasing mu: the flag must describe the active cleanup owner,
+	// never a Delete queued behind another operation, and an overlapping
+	// Delete must not inherit or clobber this one's publication.
+	e.deleting.Store(true)
+	defer e.deleting.Store(false)
 
 	return e.execState.Delete(ctx)
 }
@@ -310,16 +315,32 @@ func (e *execProcess) Status(ctx context.Context) (string, error) {
 		return s, nil
 	}
 
-	if e.deleting.Load() {
-		// A Delete is cleaning up while holding mu; answer from the observable
-		// state rather than blocking the State RPC behind the slow work.
-		e.statusMu.Lock()
-		defer e.statusMu.Unlock()
+	for {
+		if e.deleting.Load() {
+			// A Delete owns mu and is draining stdio and closing the IO;
+			// answer from the observable state rather than queueing the
+			// State RPC behind the cleanup (#14379).
+			e.statusMu.Lock()
+			defer e.statusMu.Unlock()
 
-		return e.execState.Status(ctx)
+			return e.execState.Status(ctx)
+		}
+		if e.mu.TryLock() {
+			// mu is free, or held by another reader; a Delete publishes
+			// deleting only while it owns mu, so no Delete is active and
+			// the read is serialized against the lifecycle operations
+			// exactly as before.
+			defer e.mu.Unlock()
+
+			return e.execState.Status(ctx)
+		}
+		// A non-Delete lifecycle operation owns mu — a Start publishing
+		// `running` only after the runtime exec returns, a SetExited whose
+		// transition follows the wait notification — and the reader must
+		// wait for it. Re-check on a short cadence instead of blocking on
+		// mu, so that a Delete which acquires mu after the check above is
+		// answered from the observable state rather than queueing the
+		// reader behind its cleanup.
+		time.Sleep(statusPollInterval)
 	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.execState.Status(ctx)
 }
